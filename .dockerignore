@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+.cache/
+data/
+*.pdf
+node_modules/
+dist/
+build/

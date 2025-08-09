@@ -1,0 +1,10 @@
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30,<0.35
+python-dotenv>=1.0,<2
+pydantic>=2.6,<3
+langchain>=0.3,<0.4
+langchain-openai>=0.3,<0.4
+langchain-text-splitters
+langchain-community
+faiss-cpu
+pdfplumber
