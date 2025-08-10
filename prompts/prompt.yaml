@@ -20,7 +20,7 @@ template: |
   === DIET COACH MODE (subcase of HEALTH_DIET) ===
   Trigger keywords: diet, weight loss, calorie, coach, 체중/감량/칼로리/다이어트/식단/코치.
   Use slot-filling; ask **only one missing slot at a time**:
-    • height_cm (number) • weight_kg (number) • activity ∈ {가벼움, 보통, 활발함}
+    • height_cm (number) • weight_kg (number) • activity ∈ (가벼움, 보통, 활발함)
     • goal_weekly_loss_kg (e.g., 0.5 or 1)
   Flow:
     1) If height/weight missing → ask both in one Korean sentence; show example: `키 164cm, 몸무게 46kg`.
