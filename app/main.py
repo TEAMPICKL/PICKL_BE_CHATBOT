@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import load_prompt
 from langchain_openai import ChatOpenAI
@@ -38,6 +39,16 @@ class Turn(BaseModel):
 class HistoryReq(BaseModel):
     messages: List[Turn]
     memory: Optional[str] = ""
+
+# === 제목 생성을 위한 요청/응답 스키마 ===
+class TitleReq(BaseModel):
+    message: Optional[str] = None          
+    messages: Optional[List[Turn]] = None  
+    memory: Optional[str] = ""
+    max_len: int = 20
+
+class TitleRes(BaseModel):
+    title: str
 
 # ===== 컨텍스트 빌더 =====
 def build_context(memory: str = "", messages: Optional[List[Turn]] = None, max_turns: int = 20) -> str:
@@ -87,3 +98,67 @@ async def chat_stream(req: ChatReq):
             if token:
                 yield f"data: {token}\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+# === 제목 생성용 프롬프트 & 체인 ===
+title_prompt = ChatPromptTemplate.from_template(
+    """You are a concise Korean title generator for chat threads.
+
+[Rules]
+- Output: ONLY the title text in Korean. No quotes, no punctuation at the end.
+- Length: up to {max_len} characters (hard cap).
+- Style: short, noun-phrase style (no verbs if possible), include the key intent/keyword when clear.
+- If unclear, use a minimal neutral title like "대화".
+- Do not mention dates unless the user asked about a specific date.
+- Absolutely no surrounding quotes.
+
+[Inputs]
+- question: the user's first message (Korean)
+- context: optional memory/recent chat (use only if clearly helpful)
+
+[Examples]
+- "대한민국 수도는?" -> "대한민국 수도"
+- "요즘 감기 기운 있는데 뭐 먹을까?" -> "감기 때 먹을 음식 추천"
+- "오늘 감자 시세 어때?" -> "감자 시세 검색"
+- "다이어트 식단 추천해줘" -> "다이어트 식단 추천"
+- "근처 재래시장 어디 있어?" -> "근처 재래시장 추천"
+
+[Data]
+question: {question}
+context: {context}
+max_len: {max_len}"""
+)
+title_chain = title_prompt | llm | StrOutputParser()
+
+# === 제목 생성 엔드포인트 ===
+@app.post("/title", response_model=TitleRes)
+async def make_title(req: TitleReq):
+    # 1) 첫 user 발화 추출
+    if req.message:
+        first = req.message.strip()
+    elif req.messages:
+        # 리스트에서 첫 user 메시지
+        first = next((m.content.strip() for m in req.messages if m.role == "user" and m.content.strip()), "")
+    else:
+        first = ""
+
+    if not first:
+        return TitleRes(title="대화")
+
+    # 2) context는 메모리 정도만
+    context = build_context(memory=req.memory)
+
+    # 3) LLM 호출
+    try:
+        out = await title_chain.ainvoke({"question": first, "context": context, "max_len": req.max_len})
+        title = (out or "").strip().replace('"', '').replace("'", "")
+        if not title:
+            title = "대화"
+        if len(title) > req.max_len:
+            title = title[:req.max_len]
+        title = title.rstrip(".!?~ ")
+        return TitleRes(title=title or "대화")
+    except Exception:
+        # 폴백: 첫 문장 잘라서 제목 만들기
+        s = first
+        cut = min(len(s), req.max_len)
+        return TitleRes(title=(s[:cut].rstrip(".!?~ ") or "대화"))
