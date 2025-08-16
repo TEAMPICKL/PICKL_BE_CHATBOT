@@ -13,6 +13,34 @@ from langchain_core.prompts import load_prompt, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+import asyncio, time
+
+
+# SSE data 인코딩 유틸: 멀티라인도 규격에 맞게 변환
+def sse_data(payload: str) -> str:
+    s = str(payload).replace("\r\n", "\n").replace("\r", "\n")
+    return "data: " + "\ndata: ".join(s.split("\n")) + "\n\n"
+
+# 하트비트 래퍼: 다음 토큰을 ping_interval 내에 못 받으면 댓글 프레임 전송
+async def heartbeat_wrap(token_aiter: AsyncIterator[str], ping_interval: int = 15):
+    # 스트림을 즉시 시작시키고 클라이언트 재시도 힌트 제공(선택)
+    yield "retry: 2000\n\n"     # 브라우저 직접 테스트 시 유용, Spring WebClient에는 영향 없음
+    yield ": stream-open\n\n"   # 댓글 프레임: 프록시 버퍼 비우고 연결 활성화
+
+    aiter = token_aiter.__aiter__()
+    while True:
+        try:
+            tok = await asyncio.wait_for(aiter.__anext__(), timeout=ping_interval)
+            if tok:  # 빈 토큰 방지
+                yield sse_data(tok)
+        except asyncio.TimeoutError:
+            # 댓글 기반 핑 → 디코더에 데이터로 전달되지 않음(프록시 keep-alive 용도)
+            yield f": ping {int(time.time())}\n\n"
+        except StopAsyncIteration:
+            break
+
+    # 선택: 완료 이벤트(원하면 사용)
+    yield "event: done\ndata:\n\n"
 
 # DB 유틸/헬스
 from app.db import (
@@ -139,10 +167,22 @@ async def chat_stream(req: ChatReq):
     context = build_context(memory=req.memory)
 
     async def gen():
-        async for token in stream_prompt_only(context, req.message):
-            yield f"data: {token}\n\n"  # SSE 포맷
+        # 기존 스트림 생성
+        token_stream = stream_prompt_only(context, req.message)
+        # 하트비트로 감싸기
+        async for frame in heartbeat_wrap(token_stream, ping_interval=15):
+            yield frame
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Nginx 사용 시 버퍼링 끄기(브라우저/프록시 즉시 전송)
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 # =========================
 # 3) 히스토리 기반 채팅
@@ -163,10 +203,19 @@ async def chat_history_stream(req: HistoryReq):
     question = pick_last_user_question(req.messages)
 
     async def gen():
-        async for token in stream_prompt_only(context, question):
-            yield f"data: {token}\n\n"  # SSE 포맷
+        token_stream = stream_prompt_only(context, question)
+        async for frame in heartbeat_wrap(token_stream, ping_interval=15):
+            yield frame
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 # =========================
 # 5) 제목 (그대로 유지)
