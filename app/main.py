@@ -1,16 +1,25 @@
 import os
-from typing import List, Literal, Optional, AsyncIterator, Tuple
+import json
+import re
+from typing import List, Literal, Optional, AsyncIterator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from langchain_core.prompts import load_prompt
+from langchain_core.prompts import load_prompt, ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
-from app.db import db_health
+# DB 유틸/헬스
+from app.db import (
+    db_health,
+    get_season_items_by_month,
+    get_recipes_by_season_item,
+)
 
 load_dotenv()
 
@@ -24,7 +33,7 @@ app.add_middleware(
 MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 
 # ===== prompt.yaml: 답변까지 만들어내는 단일 체인 =====
-# (이 체인 자체가 최종 답변을 생성한다)
+# (이 체인 자체가 최종 답변을 생성)
 prompt = load_prompt("prompts/prompt.yaml", encoding="utf-8")
 llm = ChatOpenAI(model=MODEL, temperature=0.2)
 
@@ -63,15 +72,50 @@ def pick_last_user_question(msgs: List[Turn]) -> str:
             return m.content.strip()
     return msgs[-1].content.strip() if msgs else ""
 
+# ===== 질문에 따라 MySQL 조회 → CONTEXT에 주입 =====
+def fetch_db_results(question: str) -> str:
+    """
+    질문을 보고 필요한 경우 MySQL에서 값을 조회해 JSON 문자열로 반환.
+    반환이 빈 문자열이면 CONTEXT에 주입하지 않음.
+    """
+    q = (question or "").strip()
+
+    # (A) "n월 제철" 같은 패턴 → 월별 제철 식재료
+    m = re.search(r'([1-9]|1[0-2])\s*월.*(제철|식재료)', q)
+    if m:
+        month = int(m.group(1))
+        res = get_season_items_by_month.invoke({"month": month})
+        return json.dumps(
+            {"kind": "season_items_by_month", "month": month, "result": res},
+            ensure_ascii=False
+        )
+
+    # (B) "옥수수 레시피", "OOO 요리", "OO 만드는 법" 등 → 식재료 레시피
+    m = re.search(r'([가-힣A-Za-z0-9]+)\s*(레시피|요리|만드는\s*법)', q)
+    if m:
+        item = m.group(1)
+        res = get_recipes_by_season_item.invoke({"season_item": item})
+        return json.dumps(
+            {"kind": "recipes_by_item", "item": item, "result": res},
+            ensure_ascii=False
+        )
+
+    return ""
+
 # ===== prompt.yaml로 '즉시 완성' =====
 async def run_prompt_only(context: str, question: str) -> str:
-    # prompt.yaml은 일반 프롬프트이므로 메시지 하나(Human)로 전달
+    db_blob = fetch_db_results(question)
+    if db_blob:
+        context = (context + "\n\n### DB_RESULTS\n" + db_blob).strip()
     rendered = prompt.format(question=question, context=context)
     resp = await llm.ainvoke([HumanMessage(content=rendered)])
     return (resp.content or "").strip()
 
 # ===== prompt.yaml로 '스트리밍' =====
 async def stream_prompt_only(context: str, question: str) -> AsyncIterator[str]:
+    db_blob = fetch_db_results(question)
+    if db_blob:
+        context = (context + "\n\n### DB_RESULTS\n" + db_blob).strip()
     rendered = prompt.format(question=question, context=context)
     async for chunk in llm.astream([HumanMessage(content=rendered)]):
         token = getattr(chunk, "content", None) or (chunk if isinstance(chunk, str) else None)
@@ -88,7 +132,7 @@ async def chat(req: ChatReq):
     return {"reply": out}
 
 # =========================
-# 2) 단발 스트리밍
+# 2) 단발 스트리밍 (SSE)
 # =========================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatReq):
@@ -96,7 +140,7 @@ async def chat_stream(req: ChatReq):
 
     async def gen():
         async for token in stream_prompt_only(context, req.message):
-            yield f"data: {token}\n\n"
+            yield f"data: {token}\n\n"  # SSE 포맷
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -111,7 +155,7 @@ async def chat_history(req: HistoryReq):
     return {"reply": out}
 
 # =========================
-# 4) 히스토리 기반 스트리밍
+# 4) 히스토리 기반 스트리밍 (SSE)
 # =========================
 @app.post("/chat/history/stream")
 async def chat_history_stream(req: HistoryReq):
@@ -120,16 +164,13 @@ async def chat_history_stream(req: HistoryReq):
 
     async def gen():
         async for token in stream_prompt_only(context, question):
-            yield f"data: {token}\n\n"
+            yield f"data: {token}\n\n"  # SSE 포맷
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 # =========================
 # 5) 제목 (그대로 유지)
 # =========================
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
 title_prompt = ChatPromptTemplate.from_template(
     """You are a concise Korean title generator for chat threads.
 

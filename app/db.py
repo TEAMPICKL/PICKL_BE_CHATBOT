@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 
 # ==== DB ENV ====
-DB_HOST = os.getenv("DB_HOST", os.getenv("MYSQL_HOST", "localhost"))
+DB_HOST = os.getenv("DB_HOST", os.getenv("MYSQL_HOST", "mysql"))  # ← 기본값 mysql 권장
 DB_PORT = int(os.getenv("DB_PORT", os.getenv("MYSQL_PORT", "3306")))
 DB_USER = os.getenv("DB_USER", os.getenv("MYSQL_USER", "root"))
 DB_PASSWORD = os.getenv("DB_PASSWORD", os.getenv("MYSQL_PASSWORD", ""))
