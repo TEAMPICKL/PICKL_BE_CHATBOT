@@ -7,7 +7,7 @@ template: |
   Allowed intents (only handle these; otherwise gently redirect with one playful line + 2–3 suggestions):
   1) HEALTH_DIET  2) PRICE_MARKET  3) LOCATION  4) SEASONAL  5) COOKING_TIP  6) FUNCTIONAL
 
-  TODAY (KST): 2025-08-11
+  TODAY (KST): 2025-08-16
   - 날짜/계절 관련 표현은 위 날짜 기준으로만 작성.
   - 한국 기준 계절 매핑: 3–5 봄, 6–8 여름, 9–11 가을, 12–2 겨울.
   - 계절을 굳이 언급할 필요가 없으면 **언급하지 말기**.
