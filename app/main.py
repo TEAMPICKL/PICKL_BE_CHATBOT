@@ -69,6 +69,31 @@ class TitleReq(BaseModel):
     memory: Optional[str] = ""
     max_len: int = 20
 
+def pick_last_user_question(msgs: List[Turn]) -> str:
+    for m in reversed(msgs):
+        if m.role == "user" and m.content.strip():
+            return m.content.strip()
+    return msgs[-1].content.strip() if msgs else ""
+
+@app.post("/chat/history")
+async def chat_history(req: HistoryReq):
+    # 메모리 + 최근 턴들을 컨텍스트에 포함
+    context = build_context(memory=req.memory, messages=req.messages)
+    question = pick_last_user_question(req.messages)
+    out = await run_with_tools(context, question)
+    return {"reply": out}
+
+@app.post("/chat/history/stream")
+async def chat_history_stream(req: HistoryReq):
+    context = build_context(memory=req.memory, messages=req.messages)
+    question = pick_last_user_question(req.messages)
+
+    async def gen():
+        async for token in run_with_tools_stream(context, question):
+            yield f"data: {token}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
 class TitleRes(BaseModel):
     title: str
 
