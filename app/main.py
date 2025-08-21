@@ -4,8 +4,6 @@ import json
 import re
 import asyncio, time
 from typing import List, Literal, Optional, AsyncIterator
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +15,9 @@ from langchain_core.prompts import load_prompt, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+import datetime as dt
+import decimal
+from zoneinfo import ZoneInfo
 
 # DB 툴/헬스
 from app.db import (
@@ -32,6 +33,14 @@ from app.db import (
 )
 
 load_dotenv()
+
+
+def json_default(o):
+    if isinstance(o, (dt.date, dt.datetime)):
+        return o.isoformat()
+    if isinstance(o, decimal.Decimal):
+        return float(o)
+    return str(o)
 
 # ===== SSE 유틸 =====
 def sse_data(payload: str) -> str:
@@ -104,7 +113,7 @@ def pick_last_user_question(msgs: List[Turn]) -> str:
 
 # ===== 날짜/시장/카테고리 감지 =====
 KST = ZoneInfo("Asia/Seoul")
-TODAY = datetime.now(KST).date()
+TODAY = dt.datetime.now(KST).date()
 
 def _detect_market(q: str) -> str | None:
     if "소매" in q: return "소매"
@@ -172,21 +181,23 @@ def fetch_db_results(question: str) -> str:
     """
     q = (question or "").strip()
     market = _detect_market(q)
-    category = detect_category(q)  
+    category = detect_category(q)
 
     # (A) n월 제철
     m = re.search(r'([1-9]|1[0-2])\s*월.*(제철|식재료)', q)
     if m:
         month = int(m.group(1))
         res = get_season_items_by_month.invoke({"month": month})
-        return json.dumps({"kind":"season_items_by_month","month":month,"result":res}, ensure_ascii=False)
+        payload = {"kind": "season_items_by_month", "month": month, "result": res}
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     # (B) 레시피
     m = re.search(r'([가-힣A-Za-z0-9]+)\s*(레시피|요리|만드는\s*법)', q)
     if m:
         item = m.group(1)
         res = get_recipes_by_season_item.invoke({"season_item": item})
-        return json.dumps({"kind":"recipes_by_item","item":item,"result":res}, ensure_ascii=False)
+        payload = {"kind": "recipes_by_item", "item": item, "result": res}
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     # (C) 오늘/어제/최근 - 품목 시세
     if re.search(r'(오늘|어제|최근|시세|가격)', q) and re.search(r'(시세|가격)', q):
@@ -194,7 +205,8 @@ def fetch_db_results(question: str) -> str:
         if m:
             item = m.group(1)
             res = get_daily_item_price.invoke({"item_name": item, "market": market})
-            return json.dumps({"kind":"daily_item_price","item":item,"market":market,"result":res}, ensure_ascii=False)
+            payload = {"kind": "daily_item_price", "item": item, "market": market, "result": res}
+            return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     # (D) 오늘/어제 - 카테고리 평균 (시장 미지정이면 DB조회 보류 → 프롬프트가 "소매/도매?" 질문)
     if category and re.search(r'(오늘|어제|최근|시세|가격|평균)', q):
@@ -211,7 +223,7 @@ def fetch_db_results(question: str) -> str:
 
         res = get_daily_category_avg.invoke({"category": category, "market": used_market})
         payload = {
-            "kind":"daily_category_avg",
+            "kind": "daily_category_avg",
             "category": category,
             "normalizedCategory": category,
             "marketRequested": market,
@@ -220,7 +232,7 @@ def fetch_db_results(question: str) -> str:
         }
         if note:
             payload["notice"] = note
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     # (E/F) 월간/연간 - 품목
     y, mth, mode = _parse_year_month_from_text(q)
@@ -229,27 +241,31 @@ def fetch_db_results(question: str) -> str:
         if m:
             item = m.group(1)
             res = get_monthly_item_price.invoke({"item_name": item, "year": y, "month": mth, "market": market})
-            return json.dumps({"kind":"monthly_item_price","item":item,"year":y,"month":mth,"market":market,"result":res}, ensure_ascii=False)
+            payload = {"kind": "monthly_item_price", "item": item, "year": y, "month": mth, "market": market, "result": res}
+            return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     if mode == "yearly" and y:
         m = re.search(r'([가-힣A-Za-z0-9]{2,})\s*(시세|가격|평균|동향|추이)', q)
         if m:
             item = m.group(1)
             res = get_yearly_item_price.invoke({"item_name": item, "year": y, "market": market})
-            return json.dumps({"kind":"yearly_item_price","item":item,"year":y,"market":market,"result":res}, ensure_ascii=False)
+            payload = {"kind": "yearly_item_price", "item": item, "year": y, "market": market, "result": res}
+            return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     # (G) 월간/연간 - 카테고리 (시장 미지정이면 질문 유도)
     if mode == "monthly" and y and mth and category:
         if not market:
             return ""
         res = get_monthly_category_avg.invoke({"category": category, "year": y, "month": mth, "market": market})
-        return json.dumps({"kind":"monthly_category_avg","category":category,"year":y,"month":mth,"market":market,"result":res}, ensure_ascii=False)
+        payload = {"kind": "monthly_category_avg", "category": category, "year": y, "month": mth, "market": market, "result": res}
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     if mode == "yearly" and y and category:
         if not market:
             return ""
         res = get_yearly_category_avg.invoke({"category": category, "year": y, "market": market})
-        return json.dumps({"kind":"yearly_category_avg","category":category,"year":y,"market":market,"result":res}, ensure_ascii=False)
+        payload = {"kind": "yearly_category_avg", "category": category, "year": y, "market": market, "result": res}
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
 
     return ""
 
