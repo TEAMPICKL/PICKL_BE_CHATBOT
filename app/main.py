@@ -1,7 +1,11 @@
+# app/main.py
 import os
 import json
 import re
+import asyncio, time
 from typing import List, Literal, Optional, AsyncIterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,59 +17,57 @@ from langchain_core.prompts import load_prompt, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-import asyncio, time
 
+# DB 툴/헬스
+from app.db import (
+    db_health,
+    get_season_items_by_month,
+    get_recipes_by_season_item,
+    get_daily_item_price,
+    get_daily_category_avg,
+    get_monthly_item_price,
+    get_yearly_item_price,
+    get_monthly_category_avg,
+    get_yearly_category_avg,
+)
 
-# SSE data 인코딩 유틸: 멀티라인도 규격에 맞게 변환
+load_dotenv()
+
+# ===== SSE 유틸 =====
 def sse_data(payload: str) -> str:
     s = str(payload).replace("\r\n", "\n").replace("\r", "\n")
     return "data: " + "\ndata: ".join(s.split("\n")) + "\n\n"
 
-# 하트비트 래퍼: 다음 토큰을 ping_interval 내에 못 받으면 댓글 프레임 전송
 async def heartbeat_wrap(token_aiter: AsyncIterator[str], ping_interval: int = 15):
-    # 스트림을 즉시 시작시키고 클라이언트 재시도 힌트 제공(선택)
-    yield "retry: 2000\n\n"     # 브라우저 직접 테스트 시 유용, Spring WebClient에는 영향 없음
-    yield ": stream-open\n\n"   # 댓글 프레임: 프록시 버퍼 비우고 연결 활성화
+    yield "retry: 2000\n\n"     # reconnection hint
+    yield ": stream-open\n\n"   # comment frame (not delivered to client handler)
 
     aiter = token_aiter.__aiter__()
     while True:
         try:
             tok = await asyncio.wait_for(aiter.__anext__(), timeout=ping_interval)
-            if tok:  # 빈 토큰 방지
+            if tok:
                 yield sse_data(tok)
         except asyncio.TimeoutError:
-            # 댓글 기반 핑 → 디코더에 데이터로 전달되지 않음(프록시 keep-alive 용도)
             yield f": ping {int(time.time())}\n\n"
         except StopAsyncIteration:
             break
 
-    # 선택: 완료 이벤트(원하면 사용)
     yield "event: done\ndata:\n\n"
 
-# DB 유틸/헬스
-from app.db import (
-    db_health,
-    get_season_items_by_month,
-    get_recipes_by_season_item,
-)
-
-load_dotenv()
-
+# ===== FastAPI/CORS =====
 app = FastAPI(title="LLM Chat Service")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
+# ===== LLM / Prompt =====
 MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-
-# ===== prompt.yaml: 답변까지 만들어내는 단일 체인 =====
-# (이 체인 자체가 최종 답변을 생성)
 prompt = load_prompt("prompts/prompt.yaml", encoding="utf-8")
 llm = ChatOpenAI(model=MODEL, temperature=0.2)
 
-# ===== 요청 스키마 =====
+# ===== pydantic 요청 스키마 =====
 class ChatReq(BaseModel):
     message: str
     memory: Optional[str] = ""
@@ -78,7 +80,7 @@ class HistoryReq(BaseModel):
     messages: List[Turn]
     memory: Optional[str] = ""
 
-# ===== 공통 컨텍스트 빌더 =====
+# ===== 컨텍스트/질문 헬퍼 =====
 def build_context(memory: str = "", messages: Optional[List[Turn]] = None, max_turns: int = 20) -> str:
     parts = []
     if memory:
@@ -100,37 +102,158 @@ def pick_last_user_question(msgs: List[Turn]) -> str:
             return m.content.strip()
     return msgs[-1].content.strip() if msgs else ""
 
-# ===== 질문에 따라 MySQL 조회 → CONTEXT에 주입 =====
+# ===== 날짜/시장/카테고리 감지 =====
+KST = ZoneInfo("Asia/Seoul")
+TODAY = datetime.now(KST).date()
+
+def _detect_market(q: str) -> str | None:
+    if "소매" in q: return "소매"
+    if "도매" in q: return "도매"
+    return None
+
+CATEGORY_SYNONYMS = {
+    "식량작물": "식량작물", "곡물": "식량작물",
+    "채소류": "채소류", "채소": "채소류",
+    "특용작물": "특용작물", "특작": "특용작물",
+    "과일류": "과일류", "과일": "과일류",
+    "축산물": "축산물", "축산": "축산물", 
+    "수산물": "수산물", "수산": "수산물",
+    "과채": "채소류",
+}
+
+UNSUPPORTED_BY_MARKET = {
+    ("도매", "축산물"),
+}
+
+def detect_category(q: str) -> Optional[str]:
+    if not q: return None
+    for k, v in CATEGORY_SYNONYMS.items():
+        if k in q:
+            return v
+    return None
+
+def _parse_year_month_from_text(q: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    텍스트에서 연/월을 해석.
+    반환: (year or None, month or None, mode)  # mode ∈ {"monthly","yearly",None}
+    """
+    q = (q or "").strip()
+
+    # "YYYY년 MM월"
+    m = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월', q)
+    if m:
+        return int(m.group(1)), int(m.group(2)), "monthly"
+
+    # "작년 MM월"
+    m = re.search(r'작년\s*(\d{1,2})\s*월', q)
+    if m:
+        return TODAY.year - 1, int(m.group(1)), "monthly"
+
+    # "지난달"/"이번달"
+    if "지난달" in q:
+        first = TODAY.replace(day=1)
+        last_month = first - __import__("datetime").timedelta(days=1)
+        return last_month.year, last_month.month, "monthly"
+    if "이번달" in q or "이달" in q:
+        return TODAY.year, TODAY.month, "monthly"
+
+    # "YYYY년" (월 없음) → yearly
+    m = re.search(r'(\d{4})\s*년(?!\s*\d+\s*월)', q)
+    if m:
+        return int(m.group(1)), None, "yearly"
+
+    return None, None, None
+
+# ===== DB 라우팅 =====
 def fetch_db_results(question: str) -> str:
     """
     질문을 보고 필요한 경우 MySQL에서 값을 조회해 JSON 문자열로 반환.
-    반환이 빈 문자열이면 CONTEXT에 주입하지 않음.
+    반환이 빈 문자열이면 CONTEXT에 주입하지 않음 → 프롬프트가 알아서 "소매/도매?" 같은 후속 질문을 하게 됨.
     """
     q = (question or "").strip()
+    market = _detect_market(q)
+    category = detect_category(q)  
 
-    # (A) "n월 제철" 같은 패턴 → 월별 제철 식재료
+    # (A) n월 제철
     m = re.search(r'([1-9]|1[0-2])\s*월.*(제철|식재료)', q)
     if m:
         month = int(m.group(1))
         res = get_season_items_by_month.invoke({"month": month})
-        return json.dumps(
-            {"kind": "season_items_by_month", "month": month, "result": res},
-            ensure_ascii=False
-        )
+        return json.dumps({"kind":"season_items_by_month","month":month,"result":res}, ensure_ascii=False)
 
-    # (B) "옥수수 레시피", "OOO 요리", "OO 만드는 법" 등 → 식재료 레시피
+    # (B) 레시피
     m = re.search(r'([가-힣A-Za-z0-9]+)\s*(레시피|요리|만드는\s*법)', q)
     if m:
         item = m.group(1)
         res = get_recipes_by_season_item.invoke({"season_item": item})
-        return json.dumps(
-            {"kind": "recipes_by_item", "item": item, "result": res},
-            ensure_ascii=False
-        )
+        return json.dumps({"kind":"recipes_by_item","item":item,"result":res}, ensure_ascii=False)
+
+    # (C) 오늘/어제/최근 - 품목 시세
+    if re.search(r'(오늘|어제|최근|시세|가격)', q) and re.search(r'(시세|가격)', q):
+        m = re.search(r'([가-힣A-Za-z0-9]{2,})\s*(시세|가격)', q)
+        if m:
+            item = m.group(1)
+            res = get_daily_item_price.invoke({"item_name": item, "market": market})
+            return json.dumps({"kind":"daily_item_price","item":item,"market":market,"result":res}, ensure_ascii=False)
+
+    # (D) 오늘/어제 - 카테고리 평균 (시장 미지정이면 DB조회 보류 → 프롬프트가 "소매/도매?" 질문)
+    if category and re.search(r'(오늘|어제|최근|시세|가격|평균)', q):
+        # 도매×축산물 → 소매로 대체하며 알림 표시
+        note = None
+        used_market = market
+        if market and (market, category) in UNSUPPORTED_BY_MARKET:
+            used_market = "소매"
+            note = "도매에는 ‘축산물’ 카테고리 데이터가 없어 소매 기준으로 안내합니다."
+
+        if not used_market:
+            # 시장을 지정하지 않았으면 DB_RESULT를 넣지 않음 → 모델이 먼저 물어본다.
+            return ""
+
+        res = get_daily_category_avg.invoke({"category": category, "market": used_market})
+        payload = {
+            "kind":"daily_category_avg",
+            "category": category,
+            "normalizedCategory": category,
+            "marketRequested": market,
+            "marketUsed": used_market,
+            "result": res
+        }
+        if note:
+            payload["notice"] = note
+        return json.dumps(payload, ensure_ascii=False)
+
+    # (E/F) 월간/연간 - 품목
+    y, mth, mode = _parse_year_month_from_text(q)
+    if mode == "monthly" and y and mth:
+        m = re.search(r'([가-힣A-Za-z0-9]{2,})\s*(시세|가격|평균|동향|추이)', q)
+        if m:
+            item = m.group(1)
+            res = get_monthly_item_price.invoke({"item_name": item, "year": y, "month": mth, "market": market})
+            return json.dumps({"kind":"monthly_item_price","item":item,"year":y,"month":mth,"market":market,"result":res}, ensure_ascii=False)
+
+    if mode == "yearly" and y:
+        m = re.search(r'([가-힣A-Za-z0-9]{2,})\s*(시세|가격|평균|동향|추이)', q)
+        if m:
+            item = m.group(1)
+            res = get_yearly_item_price.invoke({"item_name": item, "year": y, "market": market})
+            return json.dumps({"kind":"yearly_item_price","item":item,"year":y,"market":market,"result":res}, ensure_ascii=False)
+
+    # (G) 월간/연간 - 카테고리 (시장 미지정이면 질문 유도)
+    if mode == "monthly" and y and mth and category:
+        if not market:
+            return ""
+        res = get_monthly_category_avg.invoke({"category": category, "year": y, "month": mth, "market": market})
+        return json.dumps({"kind":"monthly_category_avg","category":category,"year":y,"month":mth,"market":market,"result":res}, ensure_ascii=False)
+
+    if mode == "yearly" and y and category:
+        if not market:
+            return ""
+        res = get_yearly_category_avg.invoke({"category": category, "year": y, "market": market})
+        return json.dumps({"kind":"yearly_category_avg","category":category,"year":y,"market":market,"result":res}, ensure_ascii=False)
 
     return ""
 
-# ===== prompt.yaml로 '즉시 완성' =====
+# ===== LLM 실행 =====
 async def run_prompt_only(context: str, question: str) -> str:
     db_blob = fetch_db_results(question)
     if db_blob:
@@ -139,7 +262,6 @@ async def run_prompt_only(context: str, question: str) -> str:
     resp = await llm.ainvoke([HumanMessage(content=rendered)])
     return (resp.content or "").strip()
 
-# ===== prompt.yaml로 '스트리밍' =====
 async def stream_prompt_only(context: str, question: str) -> AsyncIterator[str]:
     db_blob = fetch_db_results(question)
     if db_blob:
@@ -167,9 +289,7 @@ async def chat_stream(req: ChatReq):
     context = build_context(memory=req.memory)
 
     async def gen():
-        # 기존 스트림 생성
         token_stream = stream_prompt_only(context, req.message)
-        # 하트비트로 감싸기
         async for frame in heartbeat_wrap(token_stream, ping_interval=15):
             yield frame
 
@@ -179,7 +299,6 @@ async def chat_stream(req: ChatReq):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            # Nginx 사용 시 버퍼링 끄기(브라우저/프록시 즉시 전송)
             "X-Accel-Buffering": "no",
         },
     )
@@ -218,7 +337,7 @@ async def chat_history_stream(req: HistoryReq):
     )
 
 # =========================
-# 5) 제목 (그대로 유지)
+# 5) 제목
 # =========================
 title_prompt = ChatPromptTemplate.from_template(
     """You are a concise Korean title generator for chat threads.
