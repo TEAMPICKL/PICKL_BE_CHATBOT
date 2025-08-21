@@ -247,6 +247,11 @@ def get_daily_category_avg(category: str, market: Optional[str] = None) -> Dict[
 # ---- (3) 월간 품목: monthly_item_price (24-09 ~ 25-08) ----
 @tool("get_monthly_item_price", args_schema=MonthlyItemIn)
 def get_monthly_item_price(item_name: str, year: int, month: int, market: Optional[str] = None) -> Dict[str, Any]:
+    """
+    월간 품목 최고가(예: 2025년 8월)를 조회합니다. 테이블: monthly_item_price
+    입력: item_name(부분일치), year(YYYY), month(1-12), market(소매/도매, 옵션)
+    반환: {"table":"monthly_item_price","year":YYYY,"month":MM,"q":..., "market":..., "rows":[...], "count":N}
+    """
     table = "monthly_item_price"
     ym6 = f"{year:04d}{month:02d}"   # 'YYYYMM'
     ym7 = f"{year:04d}-{month:02d}"  # 'YYYY-MM'
@@ -271,6 +276,11 @@ def get_monthly_item_price(item_name: str, year: int, month: int, market: Option
 # ---- (4) 월간 카테고리: monthly_category_summary ----
 @tool("get_monthly_category_avg", args_schema=MonthlyCategoryIn)
 def get_monthly_category_avg(category: str, year: int, month: int, market: Optional[str] = None) -> Dict[str, Any]:
+    """
+    월간 카테고리 평균가(예: 2025년 8월)를 조회합니다. 테이블: monthly_category_summary
+    입력: category(이름/코드), year, month, market(소매/도매, 옵션)
+    반환: {"table":"monthly_category_summary","year":YYYY,"month":MM,"q":..., "market":..., "rows":[...], "count":N}
+    """
     table = "monthly_category_summary"
     ym6 = f"{year:04d}{month:02d}"   # 'YYYYMM'
     ym7 = f"{year:04d}-{month:02d}"  # 'YYYY-MM'
@@ -303,6 +313,11 @@ def get_monthly_category_avg(category: str, year: int, month: int, market: Optio
 # ---- (5) 연간 품목: yearly_item_price (5년치) ----
 @tool("get_yearly_item_price", args_schema=YearlyItemIn)
 def get_yearly_item_price(item_name: str, year: int, market: Optional[str] = None) -> Dict[str, Any]:
+    """
+    연간 품목 최고가(예: 2021년)를 조회합니다. 테이블: yearly_item_price
+    입력: item_name(부분일치), year(YYYY), market(소매/도매, 옵션)
+    반환: {"table":"yearly_item_price","year":YYYY,"q":..., "market":..., "rows":[...], "count":N}
+    """
     table = "yearly_item_price"
     with get_conn() as conn, conn.cursor() as cur:
         y_col     = find_column(conn, table, ["yyyy", "price_year", "year", "stat_year"])
@@ -325,6 +340,11 @@ def get_yearly_item_price(item_name: str, year: int, market: Optional[str] = Non
 # ---- (6) 연간 카테고리: yearly_category_summary ----
 @tool("get_yearly_category_avg", args_schema=YearlyCategoryIn)
 def get_yearly_category_avg(category: str, year: int, market: Optional[str] = None) -> Dict[str, Any]:
+    """
+    연간 카테고리 평균가(예: 2021년)를 조회합니다. 테이블: yearly_category_summary
+    입력: category(이름/코드), year(YYYY), market(소매/도매, 옵션)
+    반환: {"table":"yearly_category_summary","year":YYYY,"q":..., "market":..., "rows":[...], "count":N}
+    """
     table = "yearly_category_summary"
     with get_conn() as conn, conn.cursor() as cur:
         y_col     = find_column(conn, table, ["yyyy", "price_year", "year", "stat_year"])
