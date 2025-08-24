@@ -503,15 +503,16 @@ Schema:
   "preview": {{
     "short_description": "≤ 80자, 간결한 한 줄 소개",
     "representative_nutrient": "핵심 영양소 1–2개 (예: 비타민 C, 식이섬유)",
-    "how_to_choose": "2–3줄, 신선도/외형/향 등 실전 팁",
-    "how_to_store": "2–3줄, 냉장/상온/보관 용기 팁",
-    "how_to_trim": "2–3줄, 손질 핵심",
+    "how_to_choose": "3줄~4줄, 신선도/외형/향 등 실전 팁",
+    "how_to_store": "3줄~4줄, 냉장/상온/보관 용기 팁",
+    "how_to_trim": "3줄~4줄, 손질 핵심",
+    "tip": "보관·활용 꿀팁 2~3줄",
     "recipes": [
       {{
         "recipe_name": "레시피명",
         "ingredients": "재료, 수량은 간결히 (예: 당근 100 g, 양파 1/2개, 소금 1꼬집)",
         "instructions": "3–6단계, 짧게. '① … / ② … / ③ …' 형식 허용",
-        "tip": "간단 팁 1줄",
+        "tip": "간단 팁 2~3줄",
         "cooking_time_text": "예: 20분",
         "recommend_tags_csv": "간단,초보,한끼"  // 2–4개, 쉼표 구분
       }},
