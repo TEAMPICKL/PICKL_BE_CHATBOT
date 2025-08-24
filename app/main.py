@@ -18,6 +18,8 @@ from langchain_core.messages import HumanMessage
 import datetime as dt
 import decimal
 from zoneinfo import ZoneInfo
+import base64, jwt
+from fastapi import Depends, HTTPException, Request
 
 # DB 툴/헬스
 from app.db import (
@@ -30,10 +32,33 @@ from app.db import (
     get_yearly_item_price,
     get_monthly_category_avg,
     get_yearly_category_avg,
+    get_point_balance,
 )
 
 load_dotenv()
 
+
+
+JWT_SECRET_B64 = os.getenv("SPRING_JWT_SECRET", "")  # spring.jwt.secret 과 동일(Base64)
+JWT_SECRET = base64.b64decode(JWT_SECRET_B64)
+JWT_ALGS = ["HS256"]
+
+def current_user_id(req: Request) -> int:
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "로그인이 필요합니다")
+    token = auth.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=JWT_ALGS)
+        uid = payload.get("userId")
+        if uid is None:
+            # (옵션) sub=username만 있는 구토큰이면 여기서 401 반환하거나, username→id 매핑 로직 추가
+            raise HTTPException(401, "userId 클레임이 없습니다")
+        return int(uid)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "토큰이 만료되었습니다")
+    except Exception:
+        raise HTTPException(401, "토큰이 유효하지 않습니다")
 
 def json_default(o):
     if isinstance(o, (dt.date, dt.datetime)):
@@ -80,6 +105,7 @@ llm = ChatOpenAI(model=MODEL, temperature=0.2)
 class ChatReq(BaseModel):
     message: str
     memory: Optional[str] = ""
+    user_id: Optional[int] = None
 
 class Turn(BaseModel):
     role: Literal["user", "assistant", "system"]
@@ -88,6 +114,7 @@ class Turn(BaseModel):
 class HistoryReq(BaseModel):
     messages: List[Turn]
     memory: Optional[str] = ""
+    user_id: Optional[int] = None
 
 # ===== 컨텍스트/질문 헬퍼 =====
 def build_context(memory: str = "", messages: Optional[List[Turn]] = None, max_turns: int = 20) -> str:
@@ -110,6 +137,18 @@ def pick_last_user_question(msgs: List[Turn]) -> str:
         if m.role == "user" and m.content.strip():
             return m.content.strip()
     return msgs[-1].content.strip() if msgs else ""
+
+# ===== 메모리에서 user_id 추출 =====
+def _extract_user_id_from_memory(memory: str) -> Optional[int]:
+    if not memory:
+        return None
+    # JSON 스타일: "user_id": 123 또는 "userId": 123
+    m = re.search(r'"user[_ ]?id"\s*:\s*(\d+)', memory, re.I)
+    if m: return int(m.group(1))
+    # 프리 텍스트: user_id=123 / userId=123
+    m = re.search(r'user[_ ]?id\s*=\s*(\d+)', memory, re.I)
+    if m: return int(m.group(1))
+    return None
 
 # ===== 날짜/시장/카테고리 감지 =====
 KST = ZoneInfo("Asia/Seoul")
@@ -174,7 +213,7 @@ def _parse_year_month_from_text(q: str) -> tuple[Optional[int], Optional[int], O
     return None, None, None
 
 # ===== DB 라우팅 =====
-def fetch_db_results(question: str) -> str:
+def fetch_db_results(question: str, user_id: Optional[int] = None, memory: str = "") -> str:
     """
     질문을 보고 필요한 경우 MySQL에서 값을 조회해 JSON 문자열로 반환.
     반환이 빈 문자열이면 CONTEXT에 주입하지 않음 → 프롬프트가 알아서 "소매/도매?" 같은 후속 질문을 하게 됨.
@@ -267,19 +306,29 @@ def fetch_db_results(question: str) -> str:
         payload = {"kind": "yearly_category_avg", "category": category, "year": y, "market": market, "result": res}
         return json.dumps(payload, ensure_ascii=False, default=json_default)
 
+     # (H) 포인트 잔액
+    if re.search(r'(포인트|point|마일리지)', q) and re.search(r'(얼마|남았|잔액|balance)', q):
+        uid = user_id or _extract_user_id_from_memory(memory)
+        if not uid:
+            # 유저 식별 불가 → 모델이 "로그인이 필요…" 또는 "아이디 알려달라"는 식으로 되묻도록 DB_RESULT 미주입
+            return ""
+        res = get_point_balance.invoke({"user_id": uid})
+        payload = {"kind": "point_balance", "userId": uid, "result": res}
+        return json.dumps(payload, ensure_ascii=False, default=json_default)
+
     return ""
 
 # ===== LLM 실행 =====
-async def run_prompt_only(context: str, question: str) -> str:
-    db_blob = fetch_db_results(question)
+async def run_prompt_only(context: str, question: str, user_id: Optional[int] = None) -> str:
+    db_blob = fetch_db_results(question, user_id=user_id, memory=context)
     if db_blob:
         context = (context + "\n\n### DB_RESULTS\n" + db_blob).strip()
     rendered = prompt.format(question=question, context=context)
     resp = await llm.ainvoke([HumanMessage(content=rendered)])
     return (resp.content or "").strip()
 
-async def stream_prompt_only(context: str, question: str) -> AsyncIterator[str]:
-    db_blob = fetch_db_results(question)
+async def stream_prompt_only(context: str, question: str, user_id: Optional[int] = None) -> AsyncIterator[str]:
+    db_blob = fetch_db_results(question, user_id=user_id, memory=context)
     if db_blob:
         context = (context + "\n\n### DB_RESULTS\n" + db_blob).strip()
     rendered = prompt.format(question=question, context=context)
@@ -291,66 +340,47 @@ async def stream_prompt_only(context: str, question: str) -> AsyncIterator[str]:
 # =========================
 # 1) 단발 채팅
 # =========================
+# app/main.py
 @app.post("/chat")
-async def chat(req: ChatReq):
+async def chat(req: ChatReq, uid: int = Depends(current_user_id)):
     context = build_context(memory=req.memory)
-    out = await run_prompt_only(context, req.message)
+    out = await run_prompt_only(context, req.message, user_id=uid)
     return {"reply": out}
 
 # =========================
 # 2) 단발 스트리밍 (SSE)
 # =========================
 @app.post("/chat/stream")
-async def chat_stream(req: ChatReq):
+async def chat_stream(req: ChatReq, uid: int = Depends(current_user_id)):
     context = build_context(memory=req.memory)
-
     async def gen():
-        token_stream = stream_prompt_only(context, req.message)
+        token_stream = stream_prompt_only(context, req.message, user_id=uid)
         async for frame in heartbeat_wrap(token_stream, ping_interval=15):
             yield frame
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 # =========================
 # 3) 히스토리 기반 채팅
 # =========================
 @app.post("/chat/history")
-async def chat_history(req: HistoryReq):
+async def chat_history(req: HistoryReq, uid: int = Depends(current_user_id)):
     context = build_context(memory=req.memory, messages=req.messages)
     question = pick_last_user_question(req.messages)
-    out = await run_prompt_only(context, question)
+    out = await run_prompt_only(context, question, user_id=uid)
     return {"reply": out}
 
 # =========================
 # 4) 히스토리 기반 스트리밍 (SSE)
 # =========================
 @app.post("/chat/history/stream")
-async def chat_history_stream(req: HistoryReq):
+async def chat_history_stream(req: HistoryReq, uid: int = Depends(current_user_id)):
     context = build_context(memory=req.memory, messages=req.messages)
     question = pick_last_user_question(req.messages)
-
     async def gen():
-        token_stream = stream_prompt_only(context, question)
+        token_stream = stream_prompt_only(context, question, user_id=uid)
         async for frame in heartbeat_wrap(token_stream, ping_interval=15):
             yield frame
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 # =========================
 # 5) 제목

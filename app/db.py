@@ -179,6 +179,9 @@ class YearlyCategoryIn(BaseModel):
     category: str
     year: int = Field(..., ge=2000, le=2100)
     market: Optional[str] = None
+    
+class PointBalanceIn(BaseModel):
+    user_id: int = Field(..., ge=1, description="현재 로그인 유저 ID")
 
 # ---- (1) 오늘/어제: kamis_item_price ----
 @tool("get_daily_item_price", args_schema=DailyItemIn)
@@ -375,6 +378,36 @@ def get_yearly_category_avg(category: str, year: int, market: Optional[str] = No
         rows = cur.fetchall()
         return {"table": table, "year": year, "q": category, "market": market, "rows": rows, "count": len(rows)}
 
+# ---- (7) 본인 포인트 확인: point_wallet ----
+@tool("get_point_balance", args_schema=PointBalanceIn)
+def get_point_balance(user_id: int) -> Dict[str, Any]:
+    """
+    point_wallet에서 해당 user_id의 최신 잔액을 조회합니다.
+    반환: {"user_id":1, "exists":True, "balance":32600, "updated_at":"...", "version":28}
+    """
+    table = "point_wallet"
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT user_id, balance, updated_at, version
+              FROM {table}
+             WHERE user_id=%s
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"user_id": user_id, "exists": False}
+        return {
+            "user_id": row["user_id"],
+            "exists": True,
+            "balance": int(row["balance"]),
+            "updated_at": str(row["updated_at"]),
+            "version": row.get("version"),
+        }
+
 # ---- LangChain 툴 목록 등록 ----
 DB_TOOLS = [
     get_season_items_by_month,
@@ -385,6 +418,7 @@ DB_TOOLS = [
     get_yearly_item_price,
     get_monthly_category_avg,
     get_yearly_category_avg,
+    get_point_balance,
 ]
 
 # ==== 헬스 ====
