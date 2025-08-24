@@ -20,6 +20,9 @@ import decimal
 from zoneinfo import ZoneInfo
 import base64, jwt
 from fastapi import Depends, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional, List
+
 
 # DB 툴/헬스
 from app.db import (
@@ -458,3 +461,111 @@ async def health():
 @app.get("/health/db")
 async def health_db():
     return db_health()
+
+# =========================
+# 7) LLM 기반 제철 식재료 시드(미리보기 전용)
+# =========================
+class SeedReq(BaseModel):
+    itemname: str
+    in_season_month: int
+    mode: Optional[str] = "replace"   # "replace" | "append" (스프링에서 전달)
+    dry_run: bool = True              # 스프링은 미리보기만 원함 → True
+
+class SeedRecipe(BaseModel):
+    recipe_name: str
+    ingredients: str
+    instructions: str
+    tip: str
+    cooking_time_text: Optional[str] = ""
+    recommend_tags_csv: Optional[str] = ""
+
+class SeedPreview(BaseModel):
+    short_description: str
+    representative_nutrient: str
+    how_to_choose: str
+    how_to_store: str
+    how_to_trim: str
+    recipes: List[SeedRecipe]
+
+class SeedRes(BaseModel):
+    season_item_id: Optional[int] = None     # 파이썬은 저장 안 함 → 항상 None
+    upserted: Optional[str] = None           # 저장 안 함 → None
+    recipes_inserted: int = 0                # 저장 안 함 → 0
+    preview: SeedPreview
+
+seed_prompt = ChatPromptTemplate.from_template(
+    """You are a Korean food content generator.
+
+Return ONLY valid JSON. No markdown, no code fences.
+
+Schema:
+{{
+  "preview": {{
+    "short_description": "≤ 80자, 간결한 한 줄 소개",
+    "representative_nutrient": "핵심 영양소 1–2개 (예: 비타민 C, 식이섬유)",
+    "how_to_choose": "2–3줄, 신선도/외형/향 등 실전 팁",
+    "how_to_store": "2–3줄, 냉장/상온/보관 용기 팁",
+    "how_to_trim": "2–3줄, 손질 핵심",
+    "recipes": [
+      {{
+        "recipe_name": "레시피명",
+        "ingredients": "재료, 수량은 간결히 (예: 당근 100 g, 양파 1/2개, 소금 1꼬집)",
+        "instructions": "3–6단계, 짧게. '① … / ② … / ③ …' 형식 허용",
+        "tip": "간단 팁 1줄",
+        "cooking_time_text": "예: 20분",
+        "recommend_tags_csv": "간단,초보,한끼"  // 2–4개, 쉼표 구분
+      }},
+      {{
+        "recipe_name": "...",
+        "ingredients": "...",
+        "instructions": "...",
+        "tip": "...",
+        "cooking_time_text": "...",
+        "recommend_tags_csv": "..."
+      }}
+    ]
+  }}
+}}
+
+Constraints:
+- 모든 텍스트는 한국어.
+- 과장된 건강효능 금지, 실용 위주.
+- 단위 표기는 숫자와 단위 사이에 공백 권장 (예: 200 ml, 100 g, 30 분).
+- 항목 누락 금지(레시피 2개 꼭 포함).
+
+Inputs:
+- itemname: "{itemname}"
+- in_season_month: {month}
+"""
+)
+
+def _extract_json_block(s: str) -> dict:
+    s = (s or "").strip()
+    # 그대로 로드 시도
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # 첫 '{' ~ 마지막 '}' 추출 후 로드
+    i = s.find("{")
+    j = s.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        frag = s[i:j+1]
+        return json.loads(frag)
+    raise ValueError("LLM 출력 JSON 파싱 실패")
+
+@app.post("/seed/season-item")
+async def seed_season_item(req: SeedReq, uid: int = Depends(current_user_id)):
+    rendered = seed_prompt.format(itemname=req.itemname, month=req.in_season_month)
+    resp = await llm.ainvoke([HumanMessage(content=rendered)])
+    data = _extract_json_block(resp.content)
+
+    # 스키마 맞춰서 반환 (스프링 SeasonItemService 에서 그대로 매핑)
+    preview = data.get("preview", {})
+    # FastAPI가 자동으로 dict→JSON 변환
+    return {
+        "season_item_id": None,
+        "upserted": None,
+        "recipes_inserted": 0,
+        "preview": preview,
+    }
